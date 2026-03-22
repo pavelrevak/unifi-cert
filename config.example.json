@@ -1,0 +1,10 @@
+{
+    "controllers": [
+        {
+            "host": "unifi.example.com",
+            "domain": "unifi.example.com",
+            "username": "admin",
+            "password": "CHANGE_ME"
+        }
+    ]
+}

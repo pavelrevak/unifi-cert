@@ -1,0 +1,17 @@
+[project]
+name = "unifi-cert-deploy"
+version = "0.1.0"
+description = "Deploy Let's Encrypt certificates to UniFi OS controllers via API"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.scripts]
+unifi-cert-deploy = "unifi_cert_deploy:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
