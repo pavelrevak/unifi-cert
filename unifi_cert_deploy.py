@@ -23,6 +23,7 @@ import base64
 from datetime import datetime
 from enum import IntEnum
 import json
+import logging
 import os
 import sys
 
@@ -32,6 +33,9 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_CONFIG = "/etc/letsencrypt/hooks/.unifi-controllers.json"
+REQUEST_TIMEOUT = 30
+
+log = logging.getLogger("unifi-cert-deploy")
 
 
 class ExitCode(IntEnum):
@@ -63,33 +67,47 @@ class UniFiAPI:
         self.session.verify = verify_ssl
         self.csrf_token = None
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.logout()
+        self.session.close()
+
     def login(self, username, password):
         """Authenticate and store session cookies + CSRF token."""
         resp = self.session.post(
             f"{self.base_url}/api/auth/login",
-            json={"username": username, "password": password})
+            json={"username": username, "password": password},
+            timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         token_cookie = self.session.cookies.get("TOKEN")
         if token_cookie:
-            payload = token_cookie.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            data = json.loads(base64.b64decode(payload))
-            self.csrf_token = data.get("csrfToken")
-            if self.csrf_token:
-                self.session.headers["X-CSRF-Token"] = self.csrf_token
+            try:
+                payload = token_cookie.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                data = json.loads(base64.b64decode(payload))
+                self.csrf_token = data.get("csrfToken")
+                if self.csrf_token:
+                    self.session.headers["X-CSRF-Token"] = self.csrf_token
+            except (IndexError, ValueError) as e:
+                log.warning("Failed to parse CSRF token from JWT: %s", e)
         return resp.json()
 
     def logout(self):
         """End session."""
         try:
-            self.session.post(f"{self.base_url}/api/auth/logout")
+            self.session.post(
+                f"{self.base_url}/api/auth/logout",
+                timeout=REQUEST_TIMEOUT)
         except Exception:
             pass
 
     def list_certificates(self):
         """Get all user certificates."""
         resp = self.session.get(
-            f"{self.base_url}/api/userCertificates")
+            f"{self.base_url}/api/userCertificates",
+            timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -97,7 +115,8 @@ class UniFiAPI:
         """Upload a new certificate. Returns cert info or None if duplicate."""
         resp = self.session.post(
             f"{self.base_url}/api/userCertificates",
-            json={"name": name, "cert": cert_pem, "key": key_pem})
+            json={"name": name, "cert": cert_pem, "key": key_pem},
+            timeout=REQUEST_TIMEOUT)
         if resp.status_code == 409 or (
                 resp.status_code == 400
                 and "DUPLICATE" in resp.text.upper()):
@@ -109,12 +128,10 @@ class UniFiAPI:
         """Activate a certificate by ID."""
         resp = self.session.put(
             f"{self.base_url}/api/userCertificates/{cert_id}/status",
-            json={"active": True})
+            json={"active": True},
+            timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
-
-    def close(self):
-        self.session.close()
 
 
 def deploy_controller(ctrl, cert_path):
@@ -129,7 +146,7 @@ def deploy_controller(ctrl, cert_path):
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     cert_name = f"{domain}-{timestamp}"
 
-    print(f"\n--- {host} ({domain}) ---")
+    log.info("[%s] Starting deploy", host)
 
     try:
         with open(f"{cert_dir}/fullchain.pem") as f:
@@ -137,70 +154,61 @@ def deploy_controller(ctrl, cert_path):
         with open(f"{cert_dir}/privkey.pem") as f:
             key_pem = f.read()
     except FileNotFoundError as e:
-        print(f"  ERROR: Certificate file not found: {e}",
-            file=sys.stderr)
+        log.error("[%s] Certificate file not found: %s", host, e)
         return ExitCode.DEPLOY_FAILED
 
-    api = UniFiAPI(host)
     try:
-        api.login(ctrl["username"], ctrl["password"])
-        print("  Login OK")
+        with UniFiAPI(host) as api:
+            api.login(ctrl["username"], ctrl["password"])
+            log.info("[%s] Login OK", host)
 
-        result = api.upload_certificate(cert_name, cert_pem, key_pem)
-        if result is None:
-            print("  Certificate unchanged (duplicate fingerprint)")
-            api.logout()
-            return ExitCode.DUPLICATE
+            result = api.upload_certificate(cert_name, cert_pem, key_pem)
+            if result is None:
+                log.info(
+                    "[%s] Certificate unchanged (duplicate fingerprint)",
+                    host)
+                return ExitCode.DUPLICATE
 
-        cert_id = result["id"]
-        print(f"  Uploaded: {cert_name} "
-              f"(valid: {result['valid_from'][:10]} - "
-              f"{result['valid_to'][:10]})")
+            cert_id = result["id"]
+            log.info("[%s] Uploaded %s (valid: %s - %s)", host, cert_name,
+                result["valid_from"][:10], result["valid_to"][:10])
 
-        api.activate_certificate(cert_id)
-        print(f"  Activated: {cert_name}")
-
-        api.logout()
-        print("  Done")
-        return ExitCode.OK
+            api.activate_certificate(cert_id)
+            log.info("[%s] Activated %s", host, cert_name)
+            return ExitCode.OK
     except requests.ConnectionError:
-        print(f"  ERROR: Cannot connect to {host}", file=sys.stderr)
+        log.error("[%s] Cannot connect", host)
         return ExitCode.DEPLOY_FAILED
     except requests.Timeout:
-        print(f"  ERROR: Connection to {host} timed out",
-            file=sys.stderr)
+        log.error("[%s] Connection timed out", host)
         return ExitCode.DEPLOY_FAILED
     except requests.HTTPError as e:
-        print(f"  ERROR: API returned {e.response.status_code}: "
-              f"{e.response.text}", file=sys.stderr)
+        log.error("[%s] API returned %s: %s", host,
+            e.response.status_code, e.response.text)
         return ExitCode.DEPLOY_FAILED
     except Exception as e:
-        print(f"  ERROR: {e}", file=sys.stderr)
+        log.error("[%s] %s", host, e)
         return ExitCode.DEPLOY_FAILED
-    finally:
-        api.close()
 
 
 def list_controllers(controllers):
     """List certificates on all controllers."""
     for ctrl in controllers:
         host = ctrl["host"]
-        print(f"\n--- {host} ({ctrl['domain']}) ---")
-        api = UniFiAPI(host)
+        domain = ctrl["domain"]
+        print(f"\n--- {host} ({domain}) ---")
         try:
-            api.login(ctrl["username"], ctrl["password"])
-            certs = api.list_certificates()
-            print(f"  Certificates ({len(certs)}):")
-            for cert in certs:
-                status = "ACTIVE" if cert.get("active") else "inactive"
-                print(f"    [{status}] {cert['name']} "
-                      f"(valid: {cert['valid_from'][:10]} - "
-                      f"{cert['valid_to'][:10]})")
-            api.logout()
+            with UniFiAPI(host) as api:
+                api.login(ctrl["username"], ctrl["password"])
+                certs = api.list_certificates()
+                print(f"  Certificates ({len(certs)}):")
+                for cert in certs:
+                    status = "ACTIVE" if cert.get("active") else "inactive"
+                    print(f"    [{status}] {cert['name']} "
+                          f"(valid: {cert['valid_from'][:10]} - "
+                          f"{cert['valid_to'][:10]})")
         except Exception as e:
             print(f"  ERROR: {e}", file=sys.stderr)
-        finally:
-            api.close()
 
 
 def filter_controllers(controllers, domains):
@@ -210,8 +218,7 @@ def filter_controllers(controllers, domains):
     filtered = [c for c in controllers if c["domain"] in domains]
     unknown = domains - {c["domain"] for c in controllers}
     if unknown:
-        print(f"Warning: unknown domains: {', '.join(unknown)}",
-            file=sys.stderr)
+        log.warning("Unknown domains: %s", ", ".join(unknown))
     return filtered
 
 
@@ -238,6 +245,18 @@ def main():
 
     # Certbot mode: RENEWED_DOMAINS is set, auto-renew matching controllers
     renewed_env = os.environ.get("RENEWED_DOMAINS")
+
+    # Configure logging — skip timestamps when called by certbot
+    # (journalctl adds its own)
+    if renewed_env:
+        log_format = "%(levelname)s %(message)s"
+    else:
+        log_format = "%(asctime)s %(levelname)s %(message)s"
+    logging.basicConfig(
+        format=log_format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO)
+
     if not args.renew and not args.list and not renewed_env:
         parser.print_help()
         sys.exit(ExitCode.CONFIG_ERROR)
@@ -245,7 +264,7 @@ def main():
     try:
         config = load_config(args.config)
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as e:
-        print(f"Config error: {e}", file=sys.stderr)
+        log.error("Config error: %s", e)
         sys.exit(ExitCode.CONFIG_ERROR)
 
     controllers = config["controllers"]
@@ -260,10 +279,11 @@ def main():
     if renewed_env:
         # Certbot deploy hook mode
         domains = set(renewed_env.split())
+        log.info("Certbot mode: RENEWED_DOMAINS=%s", renewed_env)
     targets = filter_controllers(controllers, domains)
 
     if not targets:
-        print("No matching controllers")
+        log.warning("No matching controllers")
         return
 
     failed = []
@@ -279,16 +299,19 @@ def main():
             failed.append(ctrl["host"])
 
     # Summary
-    print()
     if deployed:
-        print(f"Deployed: {', '.join(deployed)}")
+        log.info("Deployed: %s", ", ".join(deployed))
     if duplicates:
-        print(f"Unchanged: {', '.join(duplicates)}")
+        log.info("Unchanged: %s", ", ".join(duplicates))
     if failed:
-        print(f"Failed: {', '.join(failed)}", file=sys.stderr)
+        log.error("Failed: %s", ", ".join(failed))
         sys.exit(ExitCode.DEPLOY_FAILED)
 
+    # When called by certbot, unchanged is not an error (exit 0).
+    # When called manually with --renew, report it (exit 2).
     if duplicates and not deployed:
+        if renewed_env:
+            sys.exit(ExitCode.OK)
         sys.exit(ExitCode.DUPLICATE)
 
 

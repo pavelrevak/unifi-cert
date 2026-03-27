@@ -160,9 +160,9 @@ unifi-cert-deploy -c /path/to/config.json --list
 
 | Code | Meaning |
 |------|---------|
-| 0 | Certificate deployed successfully |
+| 0 | Certificate deployed successfully (or unchanged when called by certbot) |
 | 1 | Deploy failed (connection error, auth failure, API error) |
-| 2 | Certificate unchanged (duplicate fingerprint) |
+| 2 | Certificate unchanged — only with `--renew` (certbot always gets 0) |
 | 3 | Configuration error (missing file, invalid JSON) |
 
 ## How it works
